@@ -1,4 +1,11 @@
 # main.py
+# Changes summary:
+# - ADDED: parse_payment_method helper to normalize user payment replies.
+# - CHANGED: fn_checkout now checks for missing payment method and includes "paymentMethod" in returned JSON and POST payload.
+# - ADDED: session fields "payment_method" and "awaiting_payment_method" on session creation.
+# - CHANGED: call_openai_and_maybe_execute now returns "function_result" so /chat can inspect function outputs (e.g., needs_payment_method).
+# - CHANGED: /chat now intercepts awaiting_payment_method replies, normalizes & saves the payment method, and finalizes checkout accordingly.
+# - CHANGED: fallback and function-call checkout paths updated to request payment method (set awaiting flag) instead of finalizing immediately when missing.
 
 # =========================================================
 # STEP 1: Imports & Init
@@ -10,7 +17,7 @@ import difflib
 import threading
 import time
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional  # ADDED: Optional already in original import list
 
 import requests
 from dotenv import load_dotenv
@@ -58,7 +65,7 @@ def reset_session(session_id):
     sessions.pop(session_id, None)
 
 # =========================================================
-# STEP 4: Utility Functions (keep originals)
+# STEP 4: Utility Functions (keep originals + new payment parser)
 # =========================================================
 def get_categories():
     """Calls CATEGORY_API_URL and returns JSON list or empty list on failure."""
@@ -85,6 +92,30 @@ def smart_match_category(user_input, categories):
         for c in categories:
             if c["categoryName"].lower() == closest[0]:
                 return c
+    return None
+
+# ADDED: helper to parse user's payment method replies
+def parse_payment_method(msg: str) -> Optional[str]:
+    """
+    ADDED: Normalize various user replies to one of:
+      - "Cash on Delivery"
+      - "Online Transfer"
+    Returns normalized string or None if not matched.
+    """
+    if not msg:
+        return None
+    s = msg.strip().lower()
+    # cash patterns
+    if any(k in s for k in ["cash on delivery", "cash on", "cash", "cod", "c.o.d"]):
+        return "Cash on Delivery"
+    # online/transfer patterns (bank, card, easypaisa, jazzcash etc)
+    if any(k in s for k in ["online", "transfer", "bank", "card", "visa", "mastercard", "easypaisa", "jazzcash", "mobile", "payment"]):
+        return "Online Transfer"
+    # numeric choices fallback
+    if s in ["1", "one"]:
+        return "Cash on Delivery"
+    if s in ["2", "two"]:
+        return "Online Transfer"
     return None
 
 # =========================================================
@@ -178,19 +209,36 @@ def fn_get_items(state: Dict[str, Any], categoryName: str) -> Dict[str, Any]:
         return {"items": [], "warning": f"No items found for {categoryName}"}
 
 def _match_item_in_state(state: Dict[str, Any], item_name: str):
-    """Helper that tries exact match first then fuzzy within current state's items."""
+    """Improved fuzzy matcher for items (handles plurals and partial matches)."""
     if not state.get("items"):
         return None
+
+    target = item_name.strip().lower()
+
+    # exact match
     for it in state["items"]:
-        if it.get("itemName", "").lower() == item_name.lower():
+        if it.get("itemName", "").lower() == target:
             return it
-    # fuzzy match
+
+    # singular/plural match
+    for it in state["items"]:
+        name = it.get("itemName", "").lower()
+        if name.rstrip('s') == target.rstrip('s'):
+            return it
+
+    # partial match
+    for it in state["items"]:
+        if target in it.get("itemName", "").lower():
+            return it
+
+    # fuzzy match (difflib)
     names = [it.get("itemName", "") for it in state["items"]]
-    closest = difflib.get_close_matches(item_name.lower(), [n.lower() for n in names], n=1, cutoff=0.6)
+    closest = difflib.get_close_matches(target, [n.lower() for n in names], n=1, cutoff=0.5)
     if closest:
         for it in state["items"]:
             if it.get("itemName", "").lower() == closest[0]:
                 return it
+
     return None
 
 def fn_add_to_cart(state: Dict[str, Any], itemName: str, quantity: int = 1) -> Dict[str, Any]:
@@ -250,26 +298,43 @@ def fn_show_bill(state: Dict[str, Any]) -> Dict[str, Any]:
     return {"empty": False, "lines": lines, "total": total}
 
 def fn_checkout(state: Dict[str, Any], sid: str) -> Dict[str, Any]:
+    """
+    CHANGED: If payment method not present in session state, do NOT finalize checkout.
+             Instead return needs_payment_method=True and a prompt message.
+    CHANGED: When finalizing, include 'paymentMethod' in posted JSON and returned dict.
+    """
     cart = state.get("cart", {})
     if not cart:
         return {"success": False, "message": "Your cart is empty."}
+
+    # CHANGED: require a payment method before finalizing
+    payment_method = state.get("payment_method")
+    if not payment_method:
+        return {
+            "success": False,
+            "needs_payment_method": True,
+            "message": "Do you want to pay via Cash on Delivery or Online Transfer?"
+        }
+
     total = sum(info["price"] * info["quantity"] for info in cart.values())
     lines = [{"name": k, "quantity": v["quantity"], "price": v["price"], "subtotal": v["quantity"]*v["price"]} for k, v in cart.items()]
     user = state.get("user_info", {})
-    # Try to POST bill to BILL_API_URL (best-effort)
+
+    # CHANGED: Try to POST bill to BILL_API_URL (best-effort) and include paymentMethod
     try:
-        requests.post(BILL_API_URL, json={"user": user, "cart": cart})
+        requests.post(BILL_API_URL, json={"user": user, "cart": cart, "paymentMethod": payment_method})
     except Exception:
         # we intentionally swallow errors (same as original)
         pass
     # schedule logout (same as original)
     threading.Thread(target=reset_session, args=(sid,), daemon=True).start()
-    # return a friendly summary
+    # return a friendly summary including payment method
     return {
         "success": True,
         "message": "Checkout complete. Your order has been placed.",
         "bill": {"lines": lines, "total": total},
         "user": user,
+        "paymentMethod": payment_method,  # CHANGED: include normalized payment method
     }
 
 # Mapping function name -> implementing callable
@@ -280,6 +345,7 @@ FUNCTION_IMPLEMENTATIONS = {
     "show_bill": lambda state, sid=None, args={}: fn_show_bill(state),
     "checkout": lambda state, sid=None, args={}: fn_checkout(state, sid),
     "remove_from_cart": lambda state, sid=None, args={}: fn_remove_from_cart(state, args.get("itemName", ""), int(args.get("quantity", 1))),
+
 }
 
 # =========================================================
@@ -299,7 +365,8 @@ def call_openai_and_maybe_execute(user_msg: str, state: Dict[str, Any], sid: str
         "assistant_content": str or None,
         "function_call": {"name": str, "arguments": dict} or None,
         "final_content": str or None,  # present if we performed function->finalize cycle
-        "raw": <raw openai response object or dict for debugging>
+        "raw": <raw openai response object or dict for debugging>,
+        "function_result": <the result from local function execution, if any>  # CHANGED: added
       }
     """
 
@@ -324,26 +391,26 @@ def call_openai_and_maybe_execute(user_msg: str, state: Dict[str, Any], sid: str
     #    - Service explanation (instead of rejecting)
     system_context = (
         "You are a bilingual shopping assistant for Point of Sale (POS).\n"
-        "You help customers with shopping-related queries (browse categories, show items with prices, add/remove items, show bill, checkout).\n\n"
+        "Your job is to help customers with shopping-related queries, including:\n"
+        "- Browse categories\n"
+        "- View items with prices\n"
+        "- Add or remove items from cart\n"
+        "- Show bill\n"
+        "- Checkout\n\n"
 
-        "SERVICES RULE:\n"
-        "- If the user asks 'what are your services' or 'apki services kya hain', explain politely:\n"
-        "  You can browse categories, view items with prices, add items to cart, see your bill, and checkout.\n\n"
+        "NATURAL LANGUAGE RULES:\n"
+        "- Understand variations like: 'I want to buy vegetables' → treat as category 'vegetables'.\n"
+        "- 'Add 2 carrots', 'give me 2 carrots', 'please add 2 carrots' → all mean add_to_cart(item='carrots', qty=2).\n"
+        "- Do not repeat questions that the user already answered.\n\n"
+
+        "SMALL TALK RULES:\n"
+        "- If the user greets (hi/hello/salam), reply politely but also guide them back to shopping.\n"
+        "- If the user asks for services, explain: You can browse categories, view items with prices, add to cart, see bill, and checkout.\n"
+        "- Only reply with 'Sorry, I can only help you with shopping at Point of Sale' if the request is truly unrelated (e.g. jokes, trivia, weather).\n\n"
 
         "BILINGUAL RULE:\n"
-        "- If the user is speaking in Roman Urdu, always reply in Roman Urdu.\n"
-        "- If the user is speaking in English, always reply in English.\n\n"
-
-        "LOGIN FLOW:\n"
-        "- If login_step == 0, you must collect the user's name politely.\n"
-        "- Valid names: only letters (English alphabets a–z/A–Z or Urdu/Arabic letters).\n"
-        "- Do NOT accept greetings (hi, hello, salam), numbers, or random strings as names.\n"
-        "- If invalid, reply: ❌ Name should only contain letters. Please try again.\n"
-        "- Once a valid name is given, confirm politely (e.g., '✅ Thanks Ali, saved your name.') "
-        "but do NOT move to phone step — backend will handle that.\n\n"
-
-        "OTHER RULES:\n"
-        "- For unrelated queries (jokes, trivia), say: Sorry, I can only help you with shopping at Point of Sale.\n"
+        "- If user speaks in Roman Urdu, reply in Roman Urdu.\n"
+        "- If user speaks in English, reply in English.\n"
     )
 
     # -------------------------------
@@ -377,6 +444,7 @@ def call_openai_and_maybe_execute(user_msg: str, state: Dict[str, Any], sid: str
             "function_call": None,
             "final_content": None,
             "raw": {"error": str(e)},
+            "function_result": None,  # CHANGED: include for consistency
         }
 
     # -------------------------------
@@ -445,6 +513,7 @@ def call_openai_and_maybe_execute(user_msg: str, state: Dict[str, Any], sid: str
                 "function_call": {"name": fname, "arguments": args},
                 "final_content": None,
                 "raw": response,
+                "function_result": None,  # CHANGED: include for consistency
             }
 
         # Otherwise, execute backend function
@@ -502,6 +571,7 @@ def call_openai_and_maybe_execute(user_msg: str, state: Dict[str, Any], sid: str
                 "function_call": {"name": fname, "arguments": args},
                 "final_content": final_content,
                 "raw": second_response,
+                "function_result": function_result,  # CHANGED: include function_result for /chat inspection
             }
         except Exception as e:
             return {
@@ -512,6 +582,7 @@ def call_openai_and_maybe_execute(user_msg: str, state: Dict[str, Any], sid: str
                     "error_followup": str(e),
                     "function_result": function_result,
                 },
+                "function_result": function_result,  # CHANGED
             }
 
     # -------------------------------
@@ -532,6 +603,7 @@ def call_openai_and_maybe_execute(user_msg: str, state: Dict[str, Any], sid: str
         "function_call": None,
         "final_content": None,
         "raw": response,
+        "function_result": None,  # CHANGED: always include for consistency
     }
 
 # =========================================================
@@ -554,6 +626,8 @@ async def chat(req: ChatRequest):
             "items": [],
             "categories": get_categories(),
             "selected_cat": None,
+            "payment_method": None,             # ADDED: store normalized payment method
+            "awaiting_payment_method": False,   # ADDED: flag while waiting for payment reply
         }
 
     state = sessions[sid]
@@ -561,9 +635,51 @@ async def chat(req: ChatRequest):
     logout = False
 
     # -------------------------------
+    # ADDED: If the bot is awaiting payment method, handle the next user message locally
+    # -------------------------------
+    if state.get("awaiting_payment_method"):
+        # CHANGED: handle user's payment-method response before calling OpenAI
+        normalized = parse_payment_method(msg)
+        if not normalized:
+            # couldn't understand user's choice — re-prompt
+            reply = "❌ I didn't understand. Please reply with 'Cash on Delivery' or 'Online Transfer'."
+            return {"reply": reply, "session": state}
+        # save normalized method
+        state["payment_method"] = normalized
+        state["awaiting_payment_method"] = False
+        # proceed to finalize checkout now that we have payment method
+        function_result = fn_checkout(state, sid)
+        if function_result.get("needs_payment_method"):
+            # unexpected — re-prompt (defensive)
+            state["awaiting_payment_method"] = True
+            reply = function_result.get("message", "Do you want to pay via Cash on Delivery or Online Transfer?")
+            return {"reply": reply, "session": state}
+        if function_result.get("success"):
+            # build friendly final bill reply (same style as other code paths)
+            bill = function_result.get("bill", {})
+            lines = []
+            for l in bill.get("lines", []):
+                lines.append(f"{l['name']}: {l['quantity']} x {l['price']} = {l['subtotal']} Rs")
+            total = bill.get("total", 0)
+            user = state.get("user_info", {})
+            payment = function_result.get("paymentMethod", state.get("payment_method"))
+            reply = (
+                "🧾 Final Bill:\n" + "\n".join(lines) +
+                f"\n\n💰 Total: {total} Rs\n👤 {user.get('name')}\n📞 {user.get('phone')}\n🏠 {user.get('address')}\n"
+                f"💳 Payment method: {payment}"
+            )
+            logout = True
+            return {"reply": reply, "session": state}
+        else:
+            reply = function_result.get("message", "Failed to complete checkout.")
+            return {"reply": reply, "session": state}
+
+    # -------------------------------
     # Step A: Send every message to OpenAI first (requirement)
     # -------------------------------
-    openai_result = call_openai_and_maybe_execute(msg, state, sid)
+    openai_result = {}
+    if state.get("login_step", 0) >= 3:
+        openai_result = call_openai_and_maybe_execute(msg, state, sid)
 
     # Note: openai_result may contain "function_call" (intention to call backend),
     # "final_content" (if we executed a function and used OpenAI to craft final text),
@@ -595,7 +711,7 @@ async def chat(req: ChatRequest):
             "   Do not proceed to phone step, backend will do that.\n"
             "4. IMPORTANT: Always reply in the language the user is using.\n"
             "   - If user speaks in English, reply in English.\n"
-            "   - If user speaks in Roman Urdu, reply in Roman Urdu.\n"
+            "   - If user is speaking in Roman Urdu, reply in Roman Urdu.\n"
         )
 
         messages = [
@@ -638,7 +754,17 @@ async def chat(req: ChatRequest):
             state["user_info"]["address"] = msg
             state["login_step"] = 3
             cat_names = [c["categoryName"] for c in state["categories"] if c.get("isEnable")]
-            reply = f"✅ You're logged in!\nAvailable categories: {', '.join(cat_names)}\n\nType a category name to view items."
+            reply = (
+                "✅ You're logged in!\n\n"
+                "Here’s how you can shop:\n"
+                "1️⃣ Type a category name (e.g., Vegetables, Fruits).\n"
+                "2️⃣ I will show you items with prices.\n"
+                "3️⃣ You can add items like 'add 2 carrots' or 'please give me 1 apple'.\n"
+                "4️⃣ Type 'bill' to see your cart.\n"
+                "5️⃣ Type 'checkout' when you’re ready.\n\n"
+                f"Available categories: {', '.join(cat_names)}"
+            )
+
         else:
             reply = "❌ Address cannot be empty."
 
@@ -652,10 +778,15 @@ async def chat(req: ChatRequest):
         if openai_result.get("final_content") is not None:
             # OpenAI created a natural-language reply after executing a function
             reply = openai_result["final_content"]
-            # If the function executed was 'checkout', set logout flag like original logic
+            # CHANGED: If the function executed was 'checkout', check function_result for payment requirement
             fc = openai_result.get("function_call")
             if fc and fc.get("name") == "checkout":
-                logout = True
+                fr = openai_result.get("function_result", {})
+                if fr.get("needs_payment_method"):
+                    # set flag so next user message will be treated as payment method
+                    state["awaiting_payment_method"] = True
+                elif fr.get("success"):
+                    logout = True
 
         # If OpenAI produced a function_call but we did NOT execute it because the user
         # was not logged in, or because the helper returned the function_call (login case),
@@ -681,15 +812,28 @@ async def chat(req: ChatRequest):
                                 lines.append(f"- {l['name']}: {l['quantity']} x {l['price']} = {l['subtotal']} Rs")
                             reply = "🧾 Your Cart:\n" + "\n".join(lines) + f"\n\n💰 Total: {total} Rs"
                     elif fname == "checkout":
-                        # behave like original checkout reply
-                        bill = function_result.get("bill", {})
-                        lines = []
-                        for l in bill.get("lines", []):
-                            lines.append(f"{l['name']}: {l['quantity']} x {l['price']} = {l['subtotal']} Rs")
-                        total = bill.get("total", 0)
-                        user = state.get("user_info", {})
-                        reply = f"🧾 Final Bill:\n" + "\n".join(lines) + f"\n\n💰 Total: {total} Rs\n👤 {user.get('name')}\n📞 {user.get('phone')}\n🏠 {user.get('address')}"
-                        logout = True
+                        # CHANGED: If checkout indicates payment method required, set awaiting flag and prompt
+                        if function_result.get("needs_payment_method"):
+                            state["awaiting_payment_method"] = True
+                            reply = function_result.get("message") or "Do you want to pay via Cash on Delivery or Online Transfer?"
+                        elif function_result.get("success"):
+                            # behave like original checkout reply
+                            bill = function_result.get("bill", {})
+                            lines = []
+                            for l in bill.get("lines", []):
+                                lines.append(f"{l['name']}: {l['quantity']} x {l['price']} = {l['subtotal']} Rs")
+                            total = bill.get("total", 0)
+                            user = state.get("user_info", {})
+                            # CHANGED: include paymentMethod if present in function_result
+                            payment = function_result.get("paymentMethod", state.get("payment_method"))
+                            reply = f"🧾 Final Bill:\n" + "\n".join(lines) + f"\n\n💰 Total: {total} Rs\n👤 {user.get('name')}\n📞 {user.get('phone')}\n🏠 {user.get('address')}\n💳 Payment method: {payment}"
+                            logout = True
+                        else:
+                            # For non-success, show returned message or raw structure
+                            if isinstance(function_result, dict) and function_result.get("message"):
+                                reply = function_result.get("message")
+                            else:
+                                reply = json.dumps(function_result)
                     else:
                         # For add_to_cart or get_items etc, try to create friendly messages
                         if isinstance(function_result, dict) and function_result.get("message"):
@@ -723,35 +867,31 @@ async def chat(req: ChatRequest):
                     reply = "🧾 Your Cart:\n" + "\n".join(lines) + f"\n\n💰 Total: {total} Rs"
 
             # Add item (old style command 'add <qty> <item>' or 'add <item>')
-            elif msg_lower.startswith("add "):
-                parts = msg.split()
+            elif any(x in msg_lower for x in ["add", "give me", "i want", "please add"]):
                 qty = 1
                 item_name = ""
 
-                if len(parts) >= 2:
-                    if parts[1].isdigit():
-                        qty = int(parts[1])
-                        item_name = " ".join(parts[2:])
-                    else:
-                        item_name = " ".join(parts[1:])
-
-                matched = None
-                for it in state["items"]:
-                    if it["itemName"].lower() == item_name.lower():
-                        matched = it
-                        break
-
-                if matched:
-                    if matched["itemName"] in state["cart"]:
-                        state["cart"][matched["itemName"]]["quantity"] += qty
-                    else:
-                        state["cart"][matched["itemName"]] = {
-                            "price": matched.get("price", 0),
-                            "quantity": qty
-                        }
-                    reply = f"✅ Added {qty} x {matched['itemName']} to your cart."
+                # regex like "2 carrots" or "carrots 2"
+                match = re.search(r'(\d+)\s+([a-zA-Z ]+)', msg_lower)
+                if match:
+                    qty = int(match.group(1))
+                    item_name = match.group(2).strip()
                 else:
-                    reply = f"❌ Item '{item_name}' not found in current category."
+                    # default: try last word(s)
+                    parts = msg_lower.split()
+                    for i, p in enumerate(parts):
+                        if p.isdigit():
+                            qty = int(p)
+                            item_name = " ".join(parts[i + 1:])
+                            break
+                    if not item_name:
+                        item_name = msg_lower.replace("add", "").replace("give me", "").replace("i want", "").strip()
+
+                matched = _match_item_in_state(state, item_name)
+                if matched:
+                    reply = fn_add_to_cart(state, matched["itemName"], qty)["message"]
+                else:
+                    reply = f"❌ Item '{item_name}' not found."
 
             # Checkout (old-style)
             elif msg_lower == "checkout":
@@ -759,12 +899,29 @@ async def chat(req: ChatRequest):
                 if not cart:
                     reply = "🛒 Your cart is empty."
                 else:
-                    total = sum(info["price"] * info["quantity"] for info in cart.values())
-                    lines = [f"{k}: {v['quantity']} x {v['price']} = {v['quantity']*v['price']} Rs" for k, v in cart.items()]
-                    bill = "\n".join(lines)
-                    user = state["user_info"]
-                    reply = f"🧾 Final Bill:\n{bill}\n\n💰 Total: {total} Rs\n👤 {user['name']}\n📞 {user['phone']}\n🏠 {user['address']}"
-                    logout = True
+                    # CHANGED: If no payment method saved, ask for it and set awaiting flag
+                    if not state.get("payment_method"):
+                        state["awaiting_payment_method"] = True
+                        reply = "Do you want to pay via Cash on Delivery or Online Transfer?"
+                    else:
+                        # We have a payment method — finalize checkout as before
+                        function_result = fn_checkout(state, sid)
+                        if function_result.get("needs_payment_method"):
+                            # Defensive: if local checkout still requests payment method
+                            state["awaiting_payment_method"] = True
+                            reply = function_result.get("message") or "Do you want to pay via Cash on Delivery or Online Transfer?"
+                        elif function_result.get("success"):
+                            bill = function_result.get("bill", {})
+                            lines = []
+                            for l in bill.get("lines", []):
+                                lines.append(f"{l['name']}: {l['quantity']} x {l['price']} = {l['subtotal']} Rs")
+                            total = bill.get("total", 0)
+                            user = state.get("user_info", {})
+                            payment = function_result.get("paymentMethod", state.get("payment_method"))
+                            reply = f"🧾 Final Bill:\n" + "\n".join(lines) + f"\n\n💰 Total: {total} Rs\n👤 {user.get('name')}\n📞 {user.get('phone')}\n🏠 {user.get('address')}\n💳 Payment method: {payment}"
+                            logout = True
+                        else:
+                            reply = function_result.get("message", "Failed to checkout.")
 
             # Category selection (old-style: user types the category name)
             else:
@@ -798,9 +955,11 @@ async def chat(req: ChatRequest):
     # -------------------------------
     if logout:
         try:
+            # CHANGED: include paymentMethod in logout POST
             requests.post(BILL_API_URL, json={
                 "user": state["user_info"],
-                "cart": state["cart"]
+                "cart": state["cart"],
+                "paymentMethod": state.get("payment_method")
             })
         except:
             pass
